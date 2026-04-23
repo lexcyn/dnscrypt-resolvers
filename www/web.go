@@ -11,12 +11,13 @@ import (
 )
 
 type WebServer struct {
-	db   *DB
-	addr string
+	db          *DB
+	addr        string
+	hideLatency bool
 }
 
-func NewWebServer(db *DB, addr string) *WebServer {
-	return &WebServer{db: db, addr: addr}
+func NewWebServer(db *DB, addr string, hideLatency bool) *WebServer {
+	return &WebServer{db: db, addr: addr, hideLatency: hideLatency}
 }
 
 func (w *WebServer) Start() {
@@ -85,6 +86,23 @@ func (w *WebServer) handleIndex(rw http.ResponseWriter, r *http.Request) {
 			}
 			return filtered[i].ReliabilityPct > filtered[j].ReliabilityPct
 		})
+	default:
+		// Default: sort by reliability desc, then by RTT asc
+		sort.Slice(filtered, func(i, j int) bool {
+			// Untested resolvers go last
+			if filtered[i].TotalTests == 0 && filtered[j].TotalTests > 0 {
+				return false
+			}
+			if filtered[i].TotalTests > 0 && filtered[j].TotalTests == 0 {
+				return true
+			}
+			// Sort by reliability descending
+			if filtered[i].ReliabilityPct != filtered[j].ReliabilityPct {
+				return filtered[i].ReliabilityPct > filtered[j].ReliabilityPct
+			}
+			// Then by RTT ascending
+			return filtered[i].AvgRTT < filtered[j].AvgRTT
+		})
 	}
 
 	types := make(map[string]int)
@@ -99,6 +117,7 @@ func (w *WebServer) handleIndex(rw http.ResponseWriter, r *http.Request) {
 		SortBy      string
 		SortOrder   string
 		LastUpdated time.Time
+		HideLatency bool
 	}{
 		Stats:       filtered,
 		Types:       types,
@@ -106,6 +125,7 @@ func (w *WebServer) handleIndex(rw http.ResponseWriter, r *http.Request) {
 		SortBy:      sortBy,
 		SortOrder:   sortOrder,
 		LastUpdated: time.Now(),
+		HideLatency: w.hideLatency,
 	}
 
 	tmpl, err := template.New("index").Funcs(template.FuncMap{
@@ -442,7 +462,7 @@ const indexTemplate = `<!DOCTYPE html>
         <header>
             <h1>Public DNS Servers Monitor</h1>
             <p class="subtitle">Real-time availability and reliability tracking for public encrypted DNS servers and relays</p>
-            <p class="subtitle" style="margin-top: 8px;"><a href="https://github.com/DNSCrypt/dnscrypt-resolvers" style="color: var(--accent);">GitHub Repository</a></p>
+            <p class="subtitle" style="margin-top: 8px;"><a href="https://github.com/DNSCrypt/dnscrypt-resolvers" style="color: var(--accent);">GitHub Repository</a> - a <a href="https://dnscrypt.info" style="color: var(--accent);">DNSCrypt</a> project</p>
         </header>
 
         <div class="filters">
@@ -460,7 +480,7 @@ const indexTemplate = `<!DOCTYPE html>
                 <select id="sort-by" onchange="applyFilters()">
                     <option value="">Default (Reliability)</option>
                     <option value="name" {{if eq .SortBy "name"}}selected{{end}}>Name</option>
-                    <option value="rtt" {{if eq .SortBy "rtt"}}selected{{end}}>RTT</option>
+                    {{if not .HideLatency}}<option value="rtt" {{if eq .SortBy "rtt"}}selected{{end}}>RTT</option>{{end}}
                     <option value="reliability" {{if eq .SortBy "reliability"}}selected{{end}}>Reliability</option>
                 </select>
             </div>
@@ -484,7 +504,7 @@ const indexTemplate = `<!DOCTYPE html>
                     <th><span class="sortable" onclick="sortBy('type')">Type<span class="sort-indicator">{{sortIndicator "type" .SortBy .SortOrder}}</span></span></th>
                     <th><span class="sortable" onclick="sortBy('reliability')">Reliability<span class="sort-indicator">{{sortIndicator "reliability" .SortBy .SortOrder}}</span></span></th>
                     <th>Tests</th>
-                    <th><span class="sortable" onclick="sortBy('rtt')">Avg RTT<span class="sort-indicator">{{sortIndicator "rtt" .SortBy .SortOrder}}</span></span></th>
+                    {{if not .HideLatency}}<th><span class="sortable" onclick="sortBy('rtt')">Avg RTT<span class="sort-indicator">{{sortIndicator "rtt" .SortBy .SortOrder}}</span></span></th>{{end}}
                     <th>Last Success</th>
                     <th>Last Error</th>
                 </tr>
@@ -507,9 +527,9 @@ const indexTemplate = `<!DOCTYPE html>
                         {{end}}
                     </td>
                     <td>{{.SuccessCount}}/{{.TotalTests}}</td>
-                    <td class="rtt">
+                    {{if not $.HideLatency}}<td class="rtt">
                         {{if gt .AvgRTT 0.0}}{{printf "%.0f" .AvgRTT}}ms{{else}}-{{end}}
-                    </td>
+                    </td>{{end}}
                     <td class="timestamp">{{formatTimePtr .LastSuccess}}</td>
                     <td class="error-text">{{truncate .LastError 50}}</td>
                 </tr>

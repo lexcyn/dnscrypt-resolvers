@@ -12,6 +12,18 @@ type DB struct {
 	db *sql.DB
 }
 
+// parseDBTime parses a time string from the database, handling both
+// RFC3339 format (returned by go-sqlite3 driver) and the space-separated
+// format used when storing.
+func parseDBTime(s string) (time.Time, error) {
+	// Try RFC3339 first (what the driver returns)
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t, nil
+	}
+	// Fall back to space-separated format
+	return time.Parse("2006-01-02 15:04:05", s)
+}
+
 type TestResult struct {
 	ID          int64
 	Name        string
@@ -61,6 +73,12 @@ func NewDB(path string) (*DB, error) {
 		return nil, err
 	}
 
+	// Migrate from old schema if needed
+	if err := migrateSchema(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to migrate schema: %w", err)
+	}
+
 	return &DB{db: db}, nil
 }
 
@@ -75,22 +93,153 @@ func createTables(db *sql.DB) error {
 		UNIQUE(name, type)
 	);
 
-	CREATE TABLE IF NOT EXISTS test_results (
+	CREATE TABLE IF NOT EXISTS stamps (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		resolver_id INTEGER NOT NULL,
 		stamp TEXT NOT NULL,
+		UNIQUE(resolver_id, stamp),
+		FOREIGN KEY (resolver_id) REFERENCES resolvers(id)
+	);
+
+	CREATE TABLE IF NOT EXISTS test_results (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		resolver_id INTEGER NOT NULL,
+		stamp_id INTEGER NOT NULL,
 		success INTEGER NOT NULL,
 		rtt_ms INTEGER,
 		error TEXT,
 		tested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-		FOREIGN KEY (resolver_id) REFERENCES resolvers(id)
+		FOREIGN KEY (resolver_id) REFERENCES resolvers(id),
+		FOREIGN KEY (stamp_id) REFERENCES stamps(id)
 	);
 
-	CREATE INDEX IF NOT EXISTS idx_test_results_resolver ON test_results(resolver_id);
+	-- For GetTestCount: MAX(tested_at)
 	CREATE INDEX IF NOT EXISTS idx_test_results_tested_at ON test_results(tested_at);
+
+	-- For RebuildStats: fetching latest stamp per resolver
+	CREATE INDEX IF NOT EXISTS idx_test_results_resolver_tested_at ON test_results(resolver_id, tested_at DESC);
+
+	-- For RebuildStats (last error) and RemoveStaleResolvers
+	CREATE INDEX IF NOT EXISTS idx_test_results_resolver_success ON test_results(resolver_id, success, tested_at DESC);
+
+	-- Pre-computed stats table for fast queries
+	CREATE TABLE IF NOT EXISTS resolver_stats (
+		resolver_id INTEGER PRIMARY KEY,
+		stamp TEXT,
+		total_tests INTEGER DEFAULT 0,
+		success_count INTEGER DEFAULT 0,
+		fail_count INTEGER DEFAULT 0,
+		avg_rtt REAL DEFAULT 0,
+		min_rtt INTEGER DEFAULT 0,
+		max_rtt INTEGER DEFAULT 0,
+		rtt_sum INTEGER DEFAULT 0,
+		last_success DATETIME,
+		last_fail DATETIME,
+		last_tested DATETIME,
+		last_error TEXT,
+		reliability_pct REAL DEFAULT 0,
+		FOREIGN KEY (resolver_id) REFERENCES resolvers(id)
+	);
 	`
 	_, err := db.Exec(schema)
 	return err
+}
+
+// migrateSchema migrates from the old schema (stamp column in test_results)
+// to the new normalized schema (stamps table with stamp_id reference).
+func migrateSchema(db *sql.DB) error {
+	// Check if migration is needed by looking for stamp column in test_results
+	var hasStampColumn bool
+	rows, err := db.Query("PRAGMA table_info(test_results)")
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notnull, &dflt, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		if name == "stamp" {
+			hasStampColumn = true
+			break
+		}
+	}
+	rows.Close()
+
+	if !hasStampColumn {
+		return nil // Already migrated
+	}
+
+	// Check if there's any data to migrate
+	var count int
+	if err := db.QueryRow("SELECT COUNT(*) FROM test_results").Scan(&count); err != nil {
+		return err
+	}
+	if count == 0 {
+		// No data, just recreate the table with new schema
+		if _, err := db.Exec("DROP TABLE IF EXISTS test_results"); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// Migration needed - populate stamps table and update test_results
+	if _, err := db.Exec(`
+		INSERT OR IGNORE INTO stamps (resolver_id, stamp)
+		SELECT DISTINCT resolver_id, stamp FROM test_results WHERE stamp IS NOT NULL
+	`); err != nil {
+		return fmt.Errorf("failed to populate stamps table: %w", err)
+	}
+
+	// Create new test_results table with stamp_id
+	if _, err := db.Exec(`
+		CREATE TABLE test_results_new (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			resolver_id INTEGER NOT NULL,
+			stamp_id INTEGER NOT NULL,
+			success INTEGER NOT NULL,
+			rtt_ms INTEGER,
+			error TEXT,
+			tested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (resolver_id) REFERENCES resolvers(id),
+			FOREIGN KEY (stamp_id) REFERENCES stamps(id)
+		)
+	`); err != nil {
+		return fmt.Errorf("failed to create new test_results table: %w", err)
+	}
+
+	// Copy data from old table to new, joining with stamps to get stamp_id
+	if _, err := db.Exec(`
+		INSERT INTO test_results_new (resolver_id, stamp_id, success, rtt_ms, error, tested_at)
+		SELECT t.resolver_id, s.id, t.success, t.rtt_ms, t.error, t.tested_at
+		FROM test_results t
+		JOIN stamps s ON t.resolver_id = s.resolver_id AND t.stamp = s.stamp
+	`); err != nil {
+		return fmt.Errorf("failed to migrate test_results data: %w", err)
+	}
+
+	// Drop old table and rename new one
+	if _, err := db.Exec("DROP TABLE test_results"); err != nil {
+		return fmt.Errorf("failed to drop old test_results table: %w", err)
+	}
+	if _, err := db.Exec("ALTER TABLE test_results_new RENAME TO test_results"); err != nil {
+		return fmt.Errorf("failed to rename test_results table: %w", err)
+	}
+
+	// Recreate indexes
+	if _, err := db.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_test_results_tested_at ON test_results(tested_at);
+		CREATE INDEX IF NOT EXISTS idx_test_results_resolver_tested_at ON test_results(resolver_id, tested_at DESC);
+		CREATE INDEX IF NOT EXISTS idx_test_results_resolver_success ON test_results(resolver_id, success, tested_at DESC);
+	`); err != nil {
+		return fmt.Errorf("failed to recreate indexes: %w", err)
+	}
+
+	return nil
 }
 
 func (d *DB) Close() error {
@@ -118,11 +267,29 @@ func (d *DB) UpsertResolver(name, typ, description, sourceFile string) (int64, e
 	return id, err
 }
 
+func (d *DB) GetOrCreateStamp(resolverID int64, stamp string) (int64, error) {
+	_, err := d.db.Exec(`
+		INSERT OR IGNORE INTO stamps (resolver_id, stamp) VALUES (?, ?)
+	`, resolverID, stamp)
+	if err != nil {
+		return 0, err
+	}
+
+	var id int64
+	err = d.db.QueryRow("SELECT id FROM stamps WHERE resolver_id = ? AND stamp = ?", resolverID, stamp).Scan(&id)
+	return id, err
+}
+
 func (d *DB) RecordTest(resolverID int64, stamp string, success bool, rttMs int64, errMsg string) error {
+	stampID, err := d.GetOrCreateStamp(resolverID, stamp)
+	if err != nil {
+		return fmt.Errorf("failed to get stamp id: %w", err)
+	}
+
 	result, err := d.db.Exec(`
-		INSERT INTO test_results (resolver_id, stamp, success, rtt_ms, error)
+		INSERT INTO test_results (resolver_id, stamp_id, success, rtt_ms, error)
 		VALUES (?, ?, ?, ?, ?)
-	`, resolverID, stamp, success, rttMs, errMsg)
+	`, resolverID, stampID, success, rttMs, errMsg)
 	if err != nil {
 		return err
 	}
@@ -131,34 +298,86 @@ func (d *DB) RecordTest(resolverID int64, stamp string, success bool, rttMs int6
 	if rows == 0 {
 		return fmt.Errorf("no rows inserted for resolver %d", resolverID)
 	}
-	return nil
+
+	// Update pre-computed stats
+	return d.updateResolverStats(resolverID, stamp, success, rttMs, errMsg)
+}
+
+func (d *DB) updateResolverStats(resolverID int64, stamp string, success bool, rttMs int64, errMsg string) error {
+	now := time.Now().Format("2006-01-02 15:04:05")
+
+	// Upsert into resolver_stats with incremental updates
+	var query string
+	var args []interface{}
+
+	if success {
+		query = `
+			INSERT INTO resolver_stats (resolver_id, stamp, total_tests, success_count, fail_count,
+				rtt_sum, avg_rtt, min_rtt, max_rtt, last_success, last_tested, reliability_pct)
+			VALUES (?, ?, 1, 1, 0, ?, ?, ?, ?, ?, ?, 100.0)
+			ON CONFLICT(resolver_id) DO UPDATE SET
+				stamp = excluded.stamp,
+				total_tests = total_tests + 1,
+				success_count = success_count + 1,
+				rtt_sum = rtt_sum + ?,
+				avg_rtt = CAST(rtt_sum + ? AS REAL) / (success_count + 1),
+				min_rtt = CASE WHEN min_rtt = 0 OR ? < min_rtt THEN ? ELSE min_rtt END,
+				max_rtt = CASE WHEN ? > max_rtt THEN ? ELSE max_rtt END,
+				last_success = ?,
+				last_tested = ?,
+				reliability_pct = CAST(success_count + 1 AS REAL) / (total_tests + 1) * 100.0
+		`
+		args = []interface{}{
+			resolverID, stamp, rttMs, rttMs, rttMs, rttMs, now, now, // INSERT values
+			rttMs, rttMs, rttMs, rttMs, rttMs, rttMs, now, now, // UPDATE values
+		}
+	} else {
+		query = `
+			INSERT INTO resolver_stats (resolver_id, stamp, total_tests, success_count, fail_count,
+				last_fail, last_tested, last_error, reliability_pct)
+			VALUES (?, ?, 1, 0, 1, ?, ?, ?, 0.0)
+			ON CONFLICT(resolver_id) DO UPDATE SET
+				stamp = excluded.stamp,
+				total_tests = total_tests + 1,
+				fail_count = fail_count + 1,
+				last_fail = ?,
+				last_tested = ?,
+				last_error = ?,
+				reliability_pct = CAST(success_count AS REAL) / (total_tests + 1) * 100.0
+		`
+		args = []interface{}{
+			resolverID, stamp, now, now, errMsg, // INSERT values
+			now, now, errMsg, // UPDATE values
+		}
+	}
+
+	_, err := d.db.Exec(query, args...)
+	return err
 }
 
 func (d *DB) GetAllStats() ([]ResolverStats, error) {
+	// Use pre-computed stats table for fast queries
+	// No ORDER BY here - web.go sorts in Go based on user preference
 	rows, err := d.db.Query(`
 		SELECT
 			r.name,
 			r.type,
 			r.description,
 			r.source_file,
-			(SELECT stamp FROM test_results t3 WHERE t3.resolver_id = r.id ORDER BY t3.tested_at DESC LIMIT 1) as stamp,
-			COUNT(t.id) as total_tests,
-			SUM(CASE WHEN t.success = 1 THEN 1 ELSE 0 END) as success_count,
-			SUM(CASE WHEN t.success = 0 THEN 1 ELSE 0 END) as fail_count,
-			COALESCE(AVG(CASE WHEN t.success = 1 THEN t.rtt_ms END), 0) as avg_rtt,
-			COALESCE(MIN(CASE WHEN t.success = 1 THEN t.rtt_ms END), 0) as min_rtt,
-			COALESCE(MAX(CASE WHEN t.success = 1 THEN t.rtt_ms END), 0) as max_rtt,
-			MAX(CASE WHEN t.success = 1 THEN t.tested_at END) as last_success,
-			MAX(CASE WHEN t.success = 0 THEN t.tested_at END) as last_fail,
-			MAX(t.tested_at) as last_tested,
-			(SELECT error FROM test_results t2 WHERE t2.resolver_id = r.id AND t2.success = 0 ORDER BY t2.tested_at DESC LIMIT 1) as last_error
+			s.stamp,
+			s.total_tests,
+			s.success_count,
+			s.fail_count,
+			s.avg_rtt,
+			s.min_rtt,
+			s.max_rtt,
+			s.last_success,
+			s.last_fail,
+			s.last_tested,
+			s.last_error,
+			s.reliability_pct
 		FROM resolvers r
-		LEFT JOIN test_results t ON r.id = t.resolver_id
-		GROUP BY r.id
-		ORDER BY
-			CASE WHEN COUNT(t.id) = 0 THEN 1 ELSE 0 END,
-			CAST(SUM(CASE WHEN t.success = 1 THEN 1 ELSE 0 END) AS FLOAT) / NULLIF(COUNT(t.id), 0) DESC,
-			AVG(CASE WHEN t.success = 1 THEN t.rtt_ms END) ASC
+		LEFT JOIN resolver_stats s ON r.id = s.resolver_id
 	`)
 	if err != nil {
 		return nil, err
@@ -171,12 +390,15 @@ func (d *DB) GetAllStats() ([]ResolverStats, error) {
 		var lastSuccess, lastFail, lastTested sql.NullString
 		var lastError sql.NullString
 		var description, sourceFile, stamp sql.NullString
+		var totalTests, successCount, failCount sql.NullInt64
+		var avgRTT, reliabilityPct sql.NullFloat64
+		var minRTT, maxRTT sql.NullInt64
 
 		err := rows.Scan(
 			&s.Name, &s.Type, &description, &sourceFile, &stamp,
-			&s.TotalTests, &s.SuccessCount, &s.FailCount,
-			&s.AvgRTT, &s.MinRTT, &s.MaxRTT,
-			&lastSuccess, &lastFail, &lastTested, &lastError,
+			&totalTests, &successCount, &failCount,
+			&avgRTT, &minRTT, &maxRTT,
+			&lastSuccess, &lastFail, &lastTested, &lastError, &reliabilityPct,
 		)
 		if err != nil {
 			return nil, err
@@ -186,27 +408,81 @@ func (d *DB) GetAllStats() ([]ResolverStats, error) {
 		s.SourceFile = sourceFile.String
 		s.Stamp = stamp.String
 		s.LastError = lastError.String
-
-		if s.TotalTests > 0 {
-			s.ReliabilityPct = float64(s.SuccessCount) / float64(s.TotalTests) * 100
-		}
+		s.TotalTests = int(totalTests.Int64)
+		s.SuccessCount = int(successCount.Int64)
+		s.FailCount = int(failCount.Int64)
+		s.AvgRTT = avgRTT.Float64
+		s.MinRTT = minRTT.Int64
+		s.MaxRTT = maxRTT.Int64
+		s.ReliabilityPct = reliabilityPct.Float64
 
 		if lastSuccess.Valid {
-			t, _ := time.Parse("2006-01-02 15:04:05", lastSuccess.String)
-			s.LastSuccess = &t
+			if t, err := parseDBTime(lastSuccess.String); err == nil {
+				s.LastSuccess = &t
+			}
 		}
 		if lastFail.Valid {
-			t, _ := time.Parse("2006-01-02 15:04:05", lastFail.String)
-			s.LastFail = &t
+			if t, err := parseDBTime(lastFail.String); err == nil {
+				s.LastFail = &t
+			}
 		}
 		if lastTested.Valid {
-			s.LastTestedAt, _ = time.Parse("2006-01-02 15:04:05", lastTested.String)
+			s.LastTestedAt, _ = parseDBTime(lastTested.String)
 		}
 
 		stats = append(stats, s)
 	}
 
 	return stats, rows.Err()
+}
+
+// RebuildStatsIfNeeded rebuilds stats only if the table is empty but test_results has data.
+func (d *DB) RebuildStatsIfNeeded() error {
+	var statsCount, testCount int
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM resolver_stats").Scan(&statsCount); err != nil {
+		return err
+	}
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM test_results").Scan(&testCount); err != nil {
+		return err
+	}
+
+	if statsCount == 0 && testCount > 0 {
+		return d.RebuildStats()
+	}
+	return nil
+}
+
+// RebuildStats recomputes all resolver_stats from test_results.
+// Call this once to migrate existing data, or to fix any inconsistencies.
+func (d *DB) RebuildStats() error {
+	_, err := d.db.Exec(`
+		DELETE FROM resolver_stats;
+
+		INSERT INTO resolver_stats (
+			resolver_id, stamp, total_tests, success_count, fail_count,
+			rtt_sum, avg_rtt, min_rtt, max_rtt,
+			last_success, last_fail, last_tested, last_error, reliability_pct
+		)
+		SELECT
+			r.id,
+			(SELECT s.stamp FROM test_results t3 JOIN stamps s ON t3.stamp_id = s.id WHERE t3.resolver_id = r.id ORDER BY t3.tested_at DESC LIMIT 1),
+			COUNT(t.id),
+			SUM(CASE WHEN t.success = 1 THEN 1 ELSE 0 END),
+			SUM(CASE WHEN t.success = 0 THEN 1 ELSE 0 END),
+			COALESCE(SUM(CASE WHEN t.success = 1 THEN t.rtt_ms ELSE 0 END), 0),
+			COALESCE(AVG(CASE WHEN t.success = 1 THEN t.rtt_ms END), 0),
+			COALESCE(MIN(CASE WHEN t.success = 1 THEN t.rtt_ms END), 0),
+			COALESCE(MAX(CASE WHEN t.success = 1 THEN t.rtt_ms END), 0),
+			MAX(CASE WHEN t.success = 1 THEN t.tested_at END),
+			MAX(CASE WHEN t.success = 0 THEN t.tested_at END),
+			MAX(t.tested_at),
+			(SELECT error FROM test_results t2 WHERE t2.resolver_id = r.id AND t2.success = 0 ORDER BY t2.tested_at DESC LIMIT 1),
+			CASE WHEN COUNT(t.id) > 0 THEN CAST(SUM(CASE WHEN t.success = 1 THEN 1 ELSE 0 END) AS REAL) / COUNT(t.id) * 100.0 ELSE 0 END
+		FROM resolvers r
+		LEFT JOIN test_results t ON r.id = t.resolver_id
+		GROUP BY r.id
+	`)
+	return err
 }
 
 // RemoveStaleResolvers removes resolvers that haven't had a successful response
@@ -255,9 +531,15 @@ func (d *DB) RemoveStaleResolvers(noSuccessSince time.Duration) ([]string, error
 		return nil, nil
 	}
 
-	// Delete test results and resolvers
+	// Delete test results, stamps, stats, and resolvers
 	for _, id := range idsToDelete {
 		if _, err := d.db.Exec("DELETE FROM test_results WHERE resolver_id = ?", id); err != nil {
+			return names, err
+		}
+		if _, err := d.db.Exec("DELETE FROM stamps WHERE resolver_id = ?", id); err != nil {
+			return names, err
+		}
+		if _, err := d.db.Exec("DELETE FROM resolver_stats WHERE resolver_id = ?", id); err != nil {
 			return names, err
 		}
 		if _, err := d.db.Exec("DELETE FROM resolvers WHERE id = ?", id); err != nil {
@@ -266,6 +548,68 @@ func (d *DB) RemoveStaleResolvers(noSuccessSince time.Duration) ([]string, error
 	}
 
 	return names, nil
+}
+
+// PruneOldTests removes test results older than the given duration and updates stats accordingly.
+// Also removes resolvers that have no remaining test results.
+// Returns the number of deleted test result rows.
+func (d *DB) PruneOldTests(maxAge time.Duration) (int64, error) {
+	cutoff := time.Now().Add(-maxAge).Format("2006-01-02 15:04:05")
+
+	result, err := d.db.Exec("DELETE FROM test_results WHERE tested_at < ?", cutoff)
+	if err != nil {
+		return 0, err
+	}
+
+	deleted, _ := result.RowsAffected()
+	if deleted > 0 {
+		// Remove orphaned resolver_stats (no remaining test results)
+		if _, err := d.db.Exec(`
+			DELETE FROM resolver_stats
+			WHERE resolver_id NOT IN (SELECT DISTINCT resolver_id FROM test_results)
+		`); err != nil {
+			return deleted, fmt.Errorf("failed to clean orphaned stats: %w", err)
+		}
+
+		// Remove orphaned stamps (no remaining test results)
+		if _, err := d.db.Exec(`
+			DELETE FROM stamps
+			WHERE id NOT IN (SELECT DISTINCT stamp_id FROM test_results)
+		`); err != nil {
+			return deleted, fmt.Errorf("failed to clean orphaned stamps: %w", err)
+		}
+
+		// Remove orphaned resolvers (no remaining test results)
+		if _, err := d.db.Exec(`
+			DELETE FROM resolvers
+			WHERE id NOT IN (SELECT DISTINCT resolver_id FROM test_results)
+		`); err != nil {
+			return deleted, fmt.Errorf("failed to clean orphaned resolvers: %w", err)
+		}
+
+		// Rebuild stats for remaining resolvers
+		if err := d.RebuildStats(); err != nil {
+			return deleted, fmt.Errorf("pruned %d rows but failed to rebuild stats: %w", deleted, err)
+		}
+
+		// Reclaim disk space and checkpoint WAL
+		if err := d.Optimize(); err != nil {
+			return deleted, fmt.Errorf("pruned %d rows but failed to optimize: %w", deleted, err)
+		}
+	}
+
+	return deleted, nil
+}
+
+// Optimize runs VACUUM to reclaim disk space and checkpoints the WAL file.
+func (d *DB) Optimize() error {
+	if _, err := d.db.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		return fmt.Errorf("wal_checkpoint failed: %w", err)
+	}
+	if _, err := d.db.Exec("VACUUM"); err != nil {
+		return fmt.Errorf("vacuum failed: %w", err)
+	}
+	return nil
 }
 
 // GetTestCount returns the total number of test results and the timestamp of the most recent one
@@ -278,7 +622,117 @@ func (d *DB) GetTestCount() (count int64, lastTest time.Time, err error) {
 		return 0, time.Time{}, err
 	}
 	if lastTestStr.Valid {
-		lastTest, _ = time.Parse("2006-01-02 15:04:05", lastTestStr.String)
+		lastTest, _ = parseDBTime(lastTestStr.String)
 	}
 	return count, lastTest, nil
+}
+
+// RemoveResolver removes a resolver by name along with all its test results, stamps, and stats.
+// Returns an error if the resolver is not found.
+func (d *DB) RemoveResolver(name string) error {
+	var id int64
+	err := d.db.QueryRow("SELECT id FROM resolvers WHERE name = ?", name).Scan(&id)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("resolver %q not found", name)
+	}
+	if err != nil {
+		return err
+	}
+
+	// Delete in order: test_results, stamps, resolver_stats, resolvers
+	if _, err := d.db.Exec("DELETE FROM test_results WHERE resolver_id = ?", id); err != nil {
+		return fmt.Errorf("failed to delete test results: %w", err)
+	}
+	if _, err := d.db.Exec("DELETE FROM stamps WHERE resolver_id = ?", id); err != nil {
+		return fmt.Errorf("failed to delete stamps: %w", err)
+	}
+	if _, err := d.db.Exec("DELETE FROM resolver_stats WHERE resolver_id = ?", id); err != nil {
+		return fmt.Errorf("failed to delete stats: %w", err)
+	}
+	if _, err := d.db.Exec("DELETE FROM resolvers WHERE id = ?", id); err != nil {
+		return fmt.Errorf("failed to delete resolver: %w", err)
+	}
+
+	return nil
+}
+
+// RemoveUnreliableResolvers removes all resolvers with reliability below the
+// given percentage threshold. Returns the names of removed resolvers.
+func (d *DB) RemoveUnreliableResolvers(minReliability float64) ([]string, error) {
+	rows, err := d.db.Query(`
+		SELECT r.id, r.name
+		FROM resolvers r
+		JOIN resolver_stats s ON r.id = s.resolver_id
+		WHERE s.reliability_pct < ?
+	`, minReliability)
+	if err != nil {
+		return nil, err
+	}
+
+	var idsToDelete []int64
+	var names []string
+	for rows.Next() {
+		var id int64
+		var name string
+		if err := rows.Scan(&id, &name); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		idsToDelete = append(idsToDelete, id)
+		names = append(names, name)
+	}
+	rows.Close()
+
+	if len(idsToDelete) == 0 {
+		return nil, nil
+	}
+
+	for _, id := range idsToDelete {
+		if _, err := d.db.Exec("DELETE FROM test_results WHERE resolver_id = ?", id); err != nil {
+			return names, err
+		}
+		if _, err := d.db.Exec("DELETE FROM stamps WHERE resolver_id = ?", id); err != nil {
+			return names, err
+		}
+		if _, err := d.db.Exec("DELETE FROM resolver_stats WHERE resolver_id = ?", id); err != nil {
+			return names, err
+		}
+		if _, err := d.db.Exec("DELETE FROM resolvers WHERE id = ?", id); err != nil {
+			return names, err
+		}
+	}
+
+	return names, nil
+}
+
+// ClearResolverErrors updates all failed tests for a resolver to successful,
+// setting their RTT to 0 and clearing error messages, then rebuilds stats.
+// Returns the number of tests updated, or an error if the resolver is not found.
+func (d *DB) ClearResolverErrors(name string) (int64, error) {
+	var id int64
+	err := d.db.QueryRow("SELECT id FROM resolvers WHERE name = ?", name).Scan(&id)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("resolver %q not found", name)
+	}
+	if err != nil {
+		return 0, err
+	}
+
+	result, err := d.db.Exec(`
+		UPDATE test_results
+		SET success = 1, error = NULL, rtt_ms = 0
+		WHERE resolver_id = ? AND success = 0
+	`, id)
+	if err != nil {
+		return 0, fmt.Errorf("failed to update test results: %w", err)
+	}
+
+	updated, _ := result.RowsAffected()
+
+	// Rebuild stats to reflect the changes
+	if err := d.RebuildStats(); err != nil {
+		return updated, fmt.Errorf("updated %d tests but failed to rebuild stats: %w", updated, err)
+	}
+
+	return updated, nil
 }
